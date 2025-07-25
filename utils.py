@@ -3,6 +3,7 @@ from sklearn.model_selection import train_test_split
 import torch
 from neural_network import TabularDataset
 from torch.utils.data import DataLoader
+from sklearn.preprocessing import StandardScaler
 
 def load_data(file_path):
     """
@@ -86,7 +87,7 @@ def get_X_cat(data, categorical_cols):
     return data[categorical_cols]
 
 
-def load_and_prepare_data(file_path, target_col, numerical_cols, categorical_cols, rows_to_remove):
+def load_and_prepare_data(file_path, target_col, numerical_cols, categorical_cols,rows_to_remove, batch_size=512):
     """
     Load and prepare the data for modeling.
     
@@ -113,10 +114,15 @@ def load_and_prepare_data(file_path, target_col, numerical_cols, categorical_col
     cat_cardinalities = [data[col].nunique() for col in categorical_cols]
 
     train_df, valid_df, test_df = split_data(data, target_col)
+
+    scaler = StandardScaler()
+    X_train_num = scaler.fit_transform(train_df[numerical_cols])
+    X_valid_num = scaler.transform(valid_df[numerical_cols])
+    X_test_num  = scaler.transform(test_df[numerical_cols])
     
-    X_train_num = torch.tensor(get_X_num(train_df, numerical_cols).values, dtype=torch.float32)
-    X_valid_num = torch.tensor(get_X_num(valid_df, numerical_cols).values, dtype=torch.float32)
-    X_test_num = torch.tensor(get_X_num(test_df, numerical_cols).values, dtype=torch.float32)
+    X_train_num = torch.tensor(X_train_num, dtype=torch.float32)
+    X_valid_num = torch.tensor(X_valid_num, dtype=torch.float32)
+    X_test_num = torch.tensor(X_test_num, dtype=torch.float32)
     
     X_train_cat = torch.tensor(get_X_cat(train_df, categorical_cols).values, dtype=torch.long)
     X_valid_cat = torch.tensor(get_X_cat(valid_df, categorical_cols).values, dtype=torch.long)
@@ -130,9 +136,9 @@ def load_and_prepare_data(file_path, target_col, numerical_cols, categorical_col
     valid_dataset = TabularDataset(X_valid_num, X_valid_cat, y_valid)
     test_dataset = TabularDataset(X_test_num, X_test_cat, y_test)
 
-    train_dataloader = DataLoader(train_dataset, batch_size=256, shuffle=True)
-    valid_dataloader = DataLoader(valid_dataset, batch_size=256)
-    test_dataloader = DataLoader(test_dataset, batch_size=256)
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size)
+    test_dataloader = DataLoader(test_dataset, batch_size=batch_size)
 
 
     

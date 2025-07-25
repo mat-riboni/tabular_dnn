@@ -64,13 +64,16 @@ class NeuralNetwork(nn.Module):
         return self.network(x)
 
 
-    def fit(self, train_dataloader, valid_dataloader, device, epochs=20, loss_fn=nn.CrossEntropyLoss(), lr=1e-3 ,optimizer=None):
+    def fit(self, train_dataloader, valid_dataloader, device, epochs=20, loss_fn=nn.CrossEntropyLoss(), lr=1e-3 ,optimizer=None, lr_scheduler=None):
         
         if optimizer is None:
-            optimizer = torch.optim.Adam(self.network.parameters(), lr=lr)
+            optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+
+        if lr_scheduler is None:
+            lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
 
         for epoch in range(epochs):
-            self.network.train()
+            self.train()
 
             for x_num, x_cat, y in train_dataloader:
                 x_num, x_cat, y = x_num.to(device), x_cat.to(device), y.to(device)
@@ -82,8 +85,15 @@ class NeuralNetwork(nn.Module):
                 loss.backward()
                 optimizer.step()
 
+                
             score, acc = self.evaluate(valid_dataloader, device)
-            print(f"--- Epoch: {epoch}  |  Loss: {loss.item():.4f}|  F1 Score: {score:.4f}  |  Accuracy: {acc:.4f} ---")
+
+            if isinstance(lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    lr_scheduler.step(score)
+            else:
+                    lr_scheduler.step() 
+
+            print(f"--- Epoch: {epoch}  |  Loss: {loss.item():.4f}  |  F1 Score: {score:.4f}  |  Accuracy: {acc:.4f} ---")
 
 
     def evaluate(self, dataloader, device):
@@ -105,7 +115,7 @@ class NeuralNetwork(nn.Module):
         all_preds = torch.cat(all_preds).numpy()
         all_labels = torch.cat(all_labels).numpy()
 
-        return f1_score(all_labels, all_preds, average='macro'), accuracy_score(all_preds,all_labels)
+        return f1_score(all_labels, all_preds, average='macro'), accuracy_score(all_labels, all_preds)
     
 
     
