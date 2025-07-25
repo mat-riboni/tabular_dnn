@@ -83,7 +83,7 @@ class NeuralNetwork(nn.Module):
                 optimizer.step()
 
             score, acc = self.evaluate(valid_dataloader, device)
-            print(f"--- Epoch: {epoch}  |  F1 Score: {score:.4f}  |  Accuracy: {acc:.4f} ---")
+            print(f"--- Epoch: {epoch}  |  Loss: {loss.item():.4f}|  F1 Score: {score:.4f}  |  Accuracy: {acc:.4f} ---")
 
 
     def evaluate(self, dataloader, device):
