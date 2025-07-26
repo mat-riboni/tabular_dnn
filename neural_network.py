@@ -72,6 +72,8 @@ class NeuralNetwork(nn.Module):
         if lr_scheduler is None:
             lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
 
+        best_f1, best_loss = -float('inf'), float('inf')
+
         for epoch in range(epochs):
             self.train()
 
@@ -86,28 +88,48 @@ class NeuralNetwork(nn.Module):
                 optimizer.step()
 
                 
-            score, acc = self.evaluate(valid_dataloader, device)
+            f1, acc = self.evaluate(valid_dataloader, device, loss_fn)
+            loss_val = loss.item()
+
+            improved = (f1 > best_f1) or (f1 == best_f1 and loss_val < best_loss)
+            acceptable = f1 > 0.9 and loss_val < 0.1
+
+            if improved:
+                best_f1 = f1
+                best_loss = loss_val
+
+            if improved and acceptable:
+                torch.save({'epoch': epoch,
+                    'model_state': self.state_dict()},
+                    'best_model.pt')
 
             if isinstance(lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    lr_scheduler.step(score)
+                    lr_scheduler.step(f1)
             else:
                     lr_scheduler.step() 
 
-            print(f"--- Epoch: {epoch}  |  Loss: {loss.item():.4f}  |  F1 Score: {score:.4f}  |  Accuracy: {acc:.4f} ---")
+            print(f"--- Epoch: {epoch}  |  Loss: {loss_val:.4f}  |  F1 Score: {f1:.4f}  |  Accuracy: {acc:.4f} ---")
 
 
-    def evaluate(self, dataloader, device):
+    def evaluate(self, dataloader, device, loss_fn):
 
         self.eval()
         
         all_preds = []
         all_labels = []
 
+        running_loss, n = 0, 0
+
         with torch.no_grad():
             for x_num, x_cat, y in dataloader:
                 x_num, x_cat, y = x_num.to(device), x_cat.to(device), y.to(device)
                 outputs = self(x_num, x_cat)
                 preds = outputs.argmax(dim=1)
+                batch_size = y.size(0)
+
+                running_loss += loss_fn(outputs, y).item() * batch_size
+                n += batch_size
+
 
                 all_preds.append(preds.cpu())
                 all_labels.append(y.cpu())
@@ -115,8 +137,11 @@ class NeuralNetwork(nn.Module):
         all_preds = torch.cat(all_preds).numpy()
         all_labels = torch.cat(all_labels).numpy()
 
-        return f1_score(all_labels, all_preds, average='macro'), accuracy_score(all_labels, all_preds)
-    
+        loss_val = running_loss / n
+        f1  = f1_score(torch.cat(all_labels), torch.cat(all_preds), average='macro')
+        acc = accuracy_score(torch.cat(all_labels), torch.cat(all_preds))
+
+        return f1, acc, loss_val
 
     
     def predict(self, dataloader, device):
