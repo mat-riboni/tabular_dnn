@@ -4,6 +4,8 @@ import torch
 from neural_network import TabularDataset
 from torch.utils.data import DataLoader
 from sklearn.preprocessing import StandardScaler
+from sklearn.utils import compute_class_weight
+import numpy as np
 
 def load_data(file_path):
     """
@@ -87,6 +89,15 @@ def get_X_cat(data, categorical_cols):
     return data[categorical_cols]
 
 
+def get_weights(y):
+    class_weights = compute_class_weight(class_weight="balanced",
+                                     classes=np.unique(y.numpy()),
+                                     y=y.numpy())
+    class_weights = torch.tensor(class_weights, dtype=torch.float32)
+    return class_weights
+
+
+
 def load_and_prepare_data(file_path, target_col, numerical_cols, categorical_cols,rows_to_remove, batch_size=512):
     """
     Load and prepare the data for modeling.
@@ -140,8 +151,10 @@ def load_and_prepare_data(file_path, target_col, numerical_cols, categorical_col
     valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size)
     test_dataloader = DataLoader(test_dataset, batch_size=batch_size)
 
+    cw = get_weights(y_train)
+
 
     
-    return train_dataloader, valid_dataloader, test_dataloader, cat_cardinalities
+    return train_dataloader, valid_dataloader, test_dataloader, cat_cardinalities, cw
 
 
