@@ -119,8 +119,12 @@ def load_and_prepare_data(file_path, target_col, numerical_cols, categorical_col
     data = keep_columns(data, numerical_cols + categorical_cols + [target_col])
     data = remove_rows(data, rows_to_remove)
 
-    for col in categorical_cols + [target_col]:
+    data[target_col] = data[target_col].astype('category')
+    class_names = data[target_col].cat.categories.tolist()
+
+    for col in categorical_cols:
         data[col] = data[col].astype('category').cat.codes
+    data[target_col] = data[target_col].cat.codes
 
     cat_cardinalities = [data[col].nunique() for col in categorical_cols]
 
@@ -155,6 +159,6 @@ def load_and_prepare_data(file_path, target_col, numerical_cols, categorical_col
 
 
     
-    return train_dataloader, valid_dataloader, test_dataloader, cat_cardinalities, cw
+    return train_dataloader, valid_dataloader, test_dataloader, cat_cardinalities, cw, class_names
 
 
