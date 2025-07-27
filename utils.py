@@ -108,9 +108,6 @@ def load_and_prepare_data(file_path, target_col, numerical_cols, categorical_col
     numerical_cols (list): List of numeric column names.
     categorical_cols (list): List of categorical column names.
     columns_to_keep (list): List of columns to keep in the final DataFrame.
-    
-    Returns:
-    Dataloader: Train, valid and test dataloaders
     """
     data = load_data(file_path)
     if data is None:

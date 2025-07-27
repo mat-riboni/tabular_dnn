@@ -132,7 +132,7 @@ class NeuralNetwork(nn.Module):
 
             if improved and acceptable:
                 torch.save({'epoch': epoch,
-                    'model_state': self.state_dict(),
+                    'state_dict': self.state_dict(),
                     'config': self.config},
                     'best_model.pt')
 
@@ -190,6 +190,24 @@ class NeuralNetwork(nn.Module):
 
         return torch.cat(all_preds)
 
+    def extract_latent_features(self, dataloader, device):
+        self.eval()
+        all_features = []
+        all_labels = []
+
+        with torch.no_grad():
+            for x_num, x_cat, y in dataloader:
+                x_num, x_cat = x_num.to(device), x_cat.to(device)
+
+                embedded = torch.cat([emb(x_cat[:, i]) for i, emb in enumerate(self.embeddings)], dim=1)
+                x = torch.cat([x_num, embedded], dim=1)
+
+                features = self.network[:-1](x)
+
+                all_features.append(features.cpu())
+                all_labels.append(y)
+
+        return torch.cat(all_features).numpy(), torch.cat(all_labels).numpy()
 
 
     def save(self, path):
