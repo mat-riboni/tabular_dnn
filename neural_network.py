@@ -1,4 +1,4 @@
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 import torch.nn as nn
 import torch
 from sklearn.metrics import f1_score, accuracy_score
@@ -15,21 +15,6 @@ class TabularDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.X_num[idx], self.X_cat[idx], self.y[idx] 
-
-    
-
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=1, gamma=2, weight=None):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.ce_loss = nn.CrossEntropyLoss(weight=weight, reduction='none')
-        
-    def forward(self, inputs, targets):
-        ce_loss = self.ce_loss(inputs, targets)
-        pt = torch.exp(-ce_loss)
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
-        return focal_loss.mean()
     
 
 class NeuralNetwork(nn.Module):
@@ -71,20 +56,37 @@ class NeuralNetwork(nn.Module):
         self.network = nn.Sequential(*layers)
 
 
+    def _embed_input(self, x_num, x_cat):
+        """Helper to process inputs"""
+        embedded_cat = []
+        for i, emb in enumerate(self.embeddings):
+            column_embedded = emb(x_cat[:,i])
+            embedded_cat.append(column_embedded)
+
+        x_cat = torch.cat(embedded_cat, dim=1)
+        x = torch.cat([x_num, x_cat], dim=1)
+        return x
 
 
     def forward(self, x_num, x_cat):
-        embedded_cat = []
-
-        for i, emb in enumerate(self.embeddings):
-            column_embedded = emb(x_cat[:,i])                                    #  Gets i-th column in batch and applies embedding
-            embedded_cat.append(column_embedded)
-
-
-        x_cat = torch.cat(embedded_cat, dim=1)
-        x = torch.cat([x_num,x_cat], dim=1)
-
+        x = self._embed_input(x_num, x_cat)
         return self.network(x)
+    
+    def forward_with_masks(self, x_num, x_cat, masks):
+        """Forward pass whith dynamic masks"""
+        x = self._embed_input(x_num, x_cat)
+        
+        layer_idx = 0
+        for layer in self.network:
+            if isinstance(layer, nn.Linear):
+                x = layer(x)
+                # Applica maschera solo ai layer lineari (escluso l'output)
+                if layer_idx < len(masks):
+                    x = x * masks[layer_idx]
+                    layer_idx += 1
+            else:
+                x = layer(x)
+        return x
 
 
     def fit(self, train_dataloader, valid_dataloader, device, epochs=20, loss_fn=nn.CrossEntropyLoss, lr=1e-3 ,optimizer=None, lr_scheduler=None, weights=None):
@@ -189,6 +191,26 @@ class NeuralNetwork(nn.Module):
                 all_preds.append(preds.cpu())
 
         return torch.cat(all_preds)
+    
+    
+    def predict_with_masks(self, dataloader, device, mask_generator, threshold=0.5):
+        self.eval()
+        mask_generator.eval()
+        all_preds = []
+
+        with torch.no_grad():
+            for x_num, x_cat, _ in dataloader:  
+                x_num, x_cat = x_num.to(device), x_cat.to(device)
+                
+                soft_masks = mask_generator(x_num, x_cat)
+                binary_masks = [(m > threshold).float() for m in soft_masks]
+                
+                outputs = self.forward_with_masks(x_num, x_cat, binary_masks)
+                preds = outputs.argmax(dim=1)
+                all_preds.append(preds.cpu())
+
+        return torch.cat(all_preds)
+
 
     def extract_latent_features(self, dataloader, device):
         self.eval()
