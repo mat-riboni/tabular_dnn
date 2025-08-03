@@ -159,3 +159,65 @@ def load_and_prepare_data(file_path, target_col, numerical_cols, categorical_col
     return train_dataloader, valid_dataloader, test_dataloader, cat_cardinalities, cw, class_names
 
 
+def load_and_prepare_nb15(file_path, target_col, numerical_cols, categorical_cols, batch_size=512):
+    """
+    Load and prepare the data for modeling.
+    
+    Parameters:
+    file_path (str): The path to the CSV file.
+    target_col: Name of target column.
+    numerical_cols (list): List of numeric column names.
+    categorical_cols (list): List of categorical column names.
+    columns_to_keep (list): List of columns to keep in the final DataFrame.
+    """
+    data = load_data(file_path)
+    if data is None:
+        return None, None, None
+    
+    data = keep_columns(data, numerical_cols + categorical_cols + [target_col])
+    data.replace([np.inf, -np.inf], np.nan, inplace=True)
+    data.dropna(inplace=True)
+
+    data[target_col] = data[target_col].astype('category')
+    class_names = data[target_col].cat.categories.tolist()
+
+    for col in categorical_cols:
+        data[col] = data[col].astype('category').cat.codes
+    data[target_col] = data[target_col].cat.codes
+
+    cat_cardinalities = [data[col].nunique() for col in categorical_cols]
+
+    train_df, valid_df, test_df = split_data(data, target_col)
+
+
+
+    scaler = StandardScaler()
+    X_train_num = scaler.fit_transform(train_df[numerical_cols])
+    X_valid_num = scaler.transform(valid_df[numerical_cols])
+    X_test_num  = scaler.transform(test_df[numerical_cols])
+    
+    X_train_num = torch.tensor(X_train_num, dtype=torch.float32)
+    X_valid_num = torch.tensor(X_valid_num, dtype=torch.float32)
+    X_test_num = torch.tensor(X_test_num, dtype=torch.float32)
+    
+    X_train_cat = torch.tensor(get_X_cat(train_df, categorical_cols).values, dtype=torch.long)
+    X_valid_cat = torch.tensor(get_X_cat(valid_df, categorical_cols).values, dtype=torch.long)
+    X_test_cat = torch.tensor(get_X_cat(test_df, categorical_cols).values, dtype=torch.long)
+
+    y_train = torch.tensor(train_df[target_col].values, dtype=torch.long)
+    y_valid = torch.tensor(valid_df[target_col].values, dtype=torch.long)
+    y_test = torch.tensor(test_df[target_col].values, dtype=torch.long)
+
+    train_dataset = TabularDataset(X_train_num, X_train_cat, y_train)
+    valid_dataset = TabularDataset(X_valid_num, X_valid_cat, y_valid)
+    test_dataset = TabularDataset(X_test_num, X_test_cat, y_test)
+
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=batch_size)
+    test_dataloader = DataLoader(test_dataset, batch_size=batch_size)
+
+    cw = get_weights(y_train)
+
+
+    
+    return train_dataloader, valid_dataloader, test_dataloader, cat_cardinalities, cw, class_names
