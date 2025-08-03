@@ -19,11 +19,12 @@ class MaskGenerator(nn.Module):
             self.shared_embeddings = False
 
         input_dim = sum(embedding_dims) + num_numerical_features
-
+        self.block = 4
+        self.block_sizes = [s // self.block for s in mask_sizes]
         self.controller = nn.Sequential(
-            nn.Linear(input_dim, 64),
+            nn.Linear(input_dim, 32),
             nn.ReLU(),
-            nn.Linear(64, sum(mask_sizes)),
+            nn.Linear(32, sum(self.block_sizes)),
         )
 
         self.config = {
@@ -44,19 +45,31 @@ class MaskGenerator(nn.Module):
         return x
 
     def forward(self, x_num, x_cat):
-        x = self._embed_input(x_num, x_cat)
-        mask_logits = self.controller(x)
-        mask = torch.sigmoid(mask_logits)
-        masks = torch.split(mask, self.mask_sizes, dim=1)
-        return masks
+        x = self._embed_input(x_num, x_cat)          
 
-    def fit(self, model, train_dataloader, valid_dataloader, device, threshold=0.5, 
+        logits_reduced = self.controller(x)       
+
+        masks = []
+        start = 0
+        for orig, blocks in zip(self.mask_sizes, self.block_sizes):
+            end = start + blocks
+            layer_mask = logits_reduced[:, start:end]\
+                            .repeat_interleave(self.block, dim=1)[:, :orig]
+            masks.append(torch.sigmoid(layer_mask)) 
+            start = end
+
+        return masks  
+
+    def fit(self, model, train_dataloader, valid_dataloader, device, threshold, 
             alpha=1e-4, epochs=20, lr=1e-3, optimizer=None, lr_scheduler=None, 
             warmup_epochs=5):
         
         self.to(device)
         model.to(device)
-        model.eval()  # Congela il modello principale
+        model.eval()  
+
+        for p in model.parameters():
+            p.requires_grad = False
 
         if optimizer is None:
             optimizer = torch.optim.Adam(self.parameters(), lr=lr)
@@ -65,7 +78,7 @@ class MaskGenerator(nn.Module):
             lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.8, patience=3)
 
         loss_fn = nn.CrossEntropyLoss()
-        best_f1, best_loss = -float('inf'), float('inf')
+        best_f1, best_loss, best_sparsity = -float('inf'), float('inf'), -float('inf')
         
         # Scheduling dinamico di alpha per incoraggiare sparsità gradualmente
         initial_alpha = alpha
@@ -89,10 +102,9 @@ class MaskGenerator(nn.Module):
                 optimizer.zero_grad()
                 masks = self(x_num, x_cat)
                 
-                with torch.no_grad():
-                    preds = model.forward_with_masks(x_num, x_cat, masks)
+                preds = model.forward_with_masks(x_num, x_cat, masks)
 
-                loss, sparsity = self._compute_masked_loss(preds, y, loss_fn, masks, current_alpha)
+                loss, sparsity = self._compute_masked_loss(preds, y, loss_fn, masks, current_alpha, threshold)
                 loss.backward()
                 optimizer.step()
                 
@@ -103,11 +115,15 @@ class MaskGenerator(nn.Module):
             f1, acc, valid_loss, valid_sparsity = self.evaluate(model, loss_fn, current_alpha, 
                                                               valid_dataloader, device, threshold)
 
-            improved = (f1 > best_f1) or (f1 == best_f1 and valid_loss < best_loss)
+            improved = (f1 > best_f1 - 0.05) and valid_sparsity > best_sparsity 
+            accettable = best_sparsity > 0.5
 
             if improved:
                 best_f1 = f1
                 best_loss = valid_loss
+                best_sparsity = valid_sparsity
+            
+            if improved and accettable:
                 torch.save({
                     'epoch': epoch,
                     'state_dict': self.state_dict(),
@@ -119,22 +135,17 @@ class MaskGenerator(nn.Module):
                 lr_scheduler.step(f1)
             else:
                 lr_scheduler.step()
-
-            avg_train_loss = epoch_loss / num_batches
-            avg_train_sparsity = epoch_sparsity / num_batches
             
-            print(f"Epoch {epoch:3d} | Train Loss: {avg_train_loss:.4f} | Train Sparsity: {avg_train_sparsity:.3f}")
-            print(f"         | Valid Loss: {valid_loss:.4f} | Valid Sparsity: {valid_sparsity:.3f} | F1: {f1:.4f} | Acc: {acc:.4f}")
-            print(f"         | Alpha: {current_alpha:.6f}")
+            print(f"Epoch {epoch:3d} | Valid Loss: {valid_loss:.4f} | Valid Sparsity: {valid_sparsity:.3f} | F1: {f1:.4f} | Acc: {acc:.4f} | Alpha: {current_alpha:.6f}")
 
-    def _compute_masked_loss(self, outputs, targets, loss_fn, masks, alpha):
+    def _compute_masked_loss(self, outputs, targets, loss_fn, masks, alpha, threshold):
         """Compute loss con regolarizzazione sparsità"""
         base_loss = loss_fn(outputs, targets)
         sparsity_loss = alpha * sum([m.mean() for m in masks])  # Penalizza valori alti (neuroni attivi)
         total_loss = base_loss + sparsity_loss
         
         # Calcola sparsità media (% neuroni disattivati con soglia 0.5)
-        avg_sparsity = sum([(m < 0.5).float().mean().item() for m in masks]) / len(masks)
+        avg_sparsity = sum([(m < threshold).float().mean().item() for m in masks]) / len(masks)
         
         return total_loss, avg_sparsity
 
@@ -155,7 +166,7 @@ class MaskGenerator(nn.Module):
                 masks = self(x_num, x_cat)
                 outputs = model.forward_with_masks(x_num, x_cat, masks)
                 
-                loss, sparsity = self._compute_masked_loss(outputs, y, loss_fn, masks, alpha)
+                loss, sparsity = self._compute_masked_loss(outputs, y, loss_fn, masks, alpha, threshold)
                 batch_size = y.size(0)
 
                 running_loss += loss.item() * batch_size
@@ -163,7 +174,7 @@ class MaskGenerator(nn.Module):
                 n += batch_size
                 num_batches += 1
 
-                preds = outputs.argmax(dim=1)  # FIX: usare argmax per classificazione
+                preds = outputs.argmax(dim=1)  
                 all_preds.append(preds.cpu())
                 all_labels.append(y.cpu())
 
