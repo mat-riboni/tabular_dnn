@@ -1,8 +1,7 @@
 from __future__ import annotations
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Union
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from sklearn.metrics import f1_score
 
  
@@ -28,124 +27,152 @@ class RawEmbedder(nn.Module):
     
 
 class Node(nn.Module):
-    """Un nodo con routing basato sulla **predizione** (non sulla label).
+    """Nodo con early-exit routing, che unifica fit/evaluate su tuple (x_num,x_cat)."""
 
-    Args
-    ----
-    in_dim      : dim vettore input (embedding precedente)
-    hidden      : unità del Linear locale
-    n_classes   : # classi che questo nodo distingue
-    tau         : confidenza minima per *early‑exit*.
-    """
-
-    def __init__(self, in_dim: int, hidden: int, n_classes: int, tau: List[int]):
+    def __init__(
+        self,
+        in_dim:    int,                   # dimensione dell'input flat
+        hidden:    int,                   # unità del layer nascosto
+        n_classes: int,                   # numero di classi locali
+        tau:       dict[int, float],      # soglie per early-exit
+        embedder:  Optional[RawEmbedder] = None,  
+    ) -> None:
         super().__init__()
-        self.dense = nn.Sequential(
+        self.embedder = embedder
+        self.dense    = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.ReLU(),
         )
-        self.head = nn.Linear(hidden, n_classes)
-        self.children = nn.ModuleDict()  
-        self.tau = tau
-        self.hidden_dim = hidden
+        self.head     = nn.Linear(hidden, n_classes)
+        self.routing_children = nn.ModuleDict()
+        self.tau      = tau
 
-    # ---------- building ----------
-    def add_child(self, class_idx: int, child: Node):
-        self.children[str(class_idx)] = child
+    def add_child(self, class_idx: int, child: Node) -> None:
+        self.routing_children[str(class_idx)] = child
 
-    def freeze(self):
-        for p in self.parameters():
-            p.requires_grad = False
+    def freeze(self, include_embedder: bool = False) -> None:
+        for p in self.dense.parameters():   p.requires_grad = False
+        for p in self.head.parameters():    p.requires_grad = False
+        if include_embedder and self.embedder:
+            for p in self.embedder.parameters(): p.requires_grad = False
 
-    # ---------- forward ----------
+    def _flat(self, x_num: torch.Tensor, x_cat: torch.Tensor) -> torch.Tensor:
+        if self.embedder:
+            return self.embedder(x_num, x_cat)
+        # se non ho embedder, assumo x_num sia già flat
+        return x_num
+
     @torch.no_grad()
-    def route(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        """Routing multilivello con soglie specifiche per classe.
-        Ritorna (logits_finali, embedding_finale, depth)."""
-        h = self.dense(x)
-        logits = self.head(h)
-        probs  = logits.softmax(1)
+    def route(self, x_flat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+        h_all      = self.dense(x_flat)
+        logits_all = self.head(h_all)
+        probs_all  = logits_all.softmax(dim=1)
 
-        # Ordina le classi per confidenza decrescente
-        sorted_classes = torch.argsort(probs, descending=True)[0]
+        sorted_idxs = torch.argsort(probs_all, dim=1, descending=True)
+        out_logits, out_h, depths = [], [], []
 
-        for class_idx in sorted_classes:
-            idx = str(class_idx.item())
-            conf = probs[0, class_idx].item()
-            if idx in self.children and conf >= self.tau.get(int(idx), 1.1):
-                return self.children[idx].route(h)
+        for i in range(x_flat.size(0)):
+            h_i      = h_all[i : i+1]
+            logits_i = logits_all[i : i+1]
 
-        # Nessuna classe supera la soglia o non ha figlio: ritorna i logits attuali
-        return logits, h, 0 
+            for class_idx in sorted_idxs[i]:
+                idx = str(int(class_idx))
+                conf = float(probs_all[i, class_idx])
+                if idx in self.routing_children and conf >= self.tau.get(int(idx), 1.1):
+                    l_c, h_c, d_c = self.routing_children[idx].route(h_i)
+                    out_logits.append(l_c)
+                    out_h.append(h_c)
+                    depths.append(d_c[0] + 1)
+                    break
+            else:
+                out_logits.append(logits_i)
+                out_h.append(h_i)
+                depths.append(0)
 
-    def forward(self, x: torch.Tensor, train: bool = False) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        """Training/inference unificato.
-        • train=True  → disattiva routing (resta qui)
-        • train=False → chiama .route()"""
-        if train or not self.children:
-            h = self.dense(x)
-            return self.head(h), h, 0
+        return (
+            torch.cat(out_logits, dim=0),
+            torch.cat(out_h,      dim=0),
+            depths
+        )
+
+    def forward(
+        self,
+        inputs: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],
+        train: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+        if isinstance(inputs, tuple):
+            x_num, x_cat = inputs
+            x_flat = self._flat(x_num, x_cat)
         else:
-            return self.route(x)
-        
-    def fit(self, train_loader, val_loader, epochs,
-            optimizer: Optional[torch.optim.Optimizer] = None, 
-            loss_fn: Optional[nn.Module] = None,
-            device: str = "cuda", lr=1e-3) -> None:
-        """Train this node.
+            x_flat = inputs
 
-        Parameters
-        ----------
-        train_loader : DataLoader yielding (x_in, y_local) for *training* samples
-        val_loader   : optional DataLoader yielding (x_in, y_local) for validation;
-                       if provided, loss / accuracy / macro‑F1 are logged each epoch.
-        optimizer    : pre‑created optimizer (default AdamW)
-        criterion    : loss function (default CrossEntropy)
-        epochs       : number of epochs
-        device       : cuda / cpu
-        """
+        if train or not self.routing_children:
+            h = self.dense(x_flat)
+            bs = x_flat.size(0)
+            return self.head(h), h, [0] * bs
+        return self.route(x_flat)
 
+    def fit(
+        self,
+        train_loader,
+        val_loader,
+        epochs:  int,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        loss_fn:   Optional[nn.Module]           = None,
+        device:    str = "cuda",
+        lr:        float = 1e-3
+    ) -> None:
+        print("🚀 ENTERED fit(), epochs=", epochs)
         self.to(device).train()
-        opt  = optimizer  or torch.optim.AdamW(self.parameters(), lr)
-        loss_fn = loss_fn  or nn.CrossEntropyLoss()
+        opt       = optimizer or torch.optim.AdamW(self.parameters(), lr)
+        criterion = loss_fn   or nn.CrossEntropyLoss()
 
         for ep in range(epochs):
-            # ----- training phase -----
             self.train()
-            tot, correct, loss_sum = 0, 0, 0.0
-            for x_in, y_local in train_loader:
-                x_in, y_local = x_in.to(device), y_local.to(device)
+            for x, y in train_loader:
+                x = x.to(device)
+                y = y.to(device)
 
-                logits, _, _ = self(x_in, train=True)
-                loss = loss_fn(logits, y_local)
+                logits, _, _ = self(x, train=True)
 
+                loss = criterion(logits, y)
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
 
-                        # ----- validation phase -----
-            metrics = self.evaluate(val_loader, loss_fn=loss_fn, device=device)        
-            self.eval()
-            print(f"[Node {id(self):x}] ep{ep:02d} | val_loss={metrics['loss']:.4f} | val_acc={metrics['acc']:.3f} val_f1={metrics['macro_f1']:.3f}")
+            metrics = self.evaluate(val_loader, loss_fn=criterion, device=device)
+            print(
+                f"[Node {id(self):x}] ep{ep:02d} | "
+                f"val_loss={metrics['loss']:.4f} | "
+                f"val_acc={metrics['acc']:.3f} | "
+                f"val_f1={metrics['macro_f1']:.3f}"
+            )
+        self.eval()
 
-    # ---------- evaluate ----------
     @torch.no_grad()
-    def evaluate(self, loader, loss_fn: Optional[nn.Module] = None,device: str = "cuda"):
-        """Return loss, accuracy, macro‑F1 on `loader`. Routing disabled."""
+    def evaluate(self, loader, loss_fn=None, device="cuda") -> dict:
         self.to(device).eval()
-        
         crit = loss_fn or nn.CrossEntropyLoss(reduction="sum")
-        total, correct, loss_sum = 0, 0, 0.0
+
+        total=correct=0
+        loss_sum=0.0
         y_true, y_pred = [], []
-        for x_in, y_local in loader:
-            x_in, y_local = x_in.to(device), y_local.to(device)
-            logits, _, _ = self(x_in, train=True)            # routing OFF
-            loss_sum += crit(logits, y_local).item()
-            preds = logits.argmax(1)
-            correct += (preds==y_local).sum().item()
-            total   += x_in.size(0)
-            y_true += y_local.cpu().tolist()
-            y_pred += preds.cpu().tolist()
-        acc = correct/total
-        f1  = f1_score(y_true, y_pred, average="macro")
-        return {"loss": loss_sum/total, "acc": acc, "macro_f1": f1}
+
+        for x, y in loader:
+            x = x.to(device)
+            y = y.to(device)
+
+            logits, _, _ = self(x, train=True)
+
+            loss_sum += crit(logits, y).item()
+            preds    = logits.argmax(dim=1)
+            correct += (preds == y).sum().item()
+            total   += y.size(0)
+            y_true  += y.cpu().tolist()
+            y_pred  += preds.cpu().tolist()
+
+        return {
+            "loss":     loss_sum / total,
+            "acc":      correct / total,
+            "macro_f1": f1_score(y_true, y_pred, average="macro")
+        }
